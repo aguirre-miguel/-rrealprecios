@@ -625,7 +625,7 @@
       <input id="cloudKey" type="text" autocomplete="off" placeholder="anon public key" style="width:100%;padding:9px;border:1.5px solid #d0d8e8;border-radius:8px;font-size:12px;margin-bottom:8px;outline:none">
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button id="btnCloudSave" class="btn btn-green" onclick="cloudSaveCfg()" style="flex:1;min-width:110px">🔌 Conectar</button>
-        <button id="btnCloudSync" class="btn btn-blue" onclick="cloudPull(true)" style="flex:1;min-width:110px">🔄 Sincronizar ahora</button>
+        <button id="btnCloudSync" class="btn btn-blue" onclick="cloudSyncNow()" style="flex:1;min-width:110px">🔄 Sincronizar ahora</button>
         <button id="btnCloudOff" class="btn btn-gray" onclick="cloudDisconnect()" style="flex:1;min-width:100px">Desconectar</button>
       </div>
       <div id="cloudStatus" style="font-size:11px;color:#64748b;margin-top:8px"></div>
@@ -1569,7 +1569,7 @@ function cloudSaveCfg(){
   _cloudCfg={url:url,key:key};
   try{localStorage.setItem(CLOUD_CFG_KEY,JSON.stringify(_cloudCfg));}catch(e){}
   showToast(es?'🔌 Conectando a la nube…':'🔌 Connecting to cloud…');
-  _cloudStartPolling(); cloudPull(true);
+  try{localStorage.setItem('_cloudDirty','0');localStorage.removeItem('_cloudSeenRemote');}catch(e){} _cloudStartPolling(); cloudPull(true);
 }
 function cloudDisconnect(){
   const es=currentLang!=='en';
@@ -1583,11 +1583,12 @@ async function cloudPush(silent){
   try{
     if(!silent)_cloudStatus(es?'⏳ Guardando…':'⏳ Saving…','#d97706');
     const _pushTs=Date.now();
-    const body=[{id:'main',data:cloudCollect(),updated_at:new Date(_pushTs).toISOString()}];
+    const _stamp=new Date(_pushTs).toISOString();
+    const body=[{id:'main',data:cloudCollect(),updated_at:_stamp}];
     const r=await fetch(_cloudUrl()+'?on_conflict=id',{method:'POST',headers:Object.assign({'Prefer':'resolution=merge-duplicates,return=minimal'},_cloudHeaders()),body:JSON.stringify(body)});
     if(!r.ok)throw new Error('HTTP '+r.status);
     _cloudLastRemote=Date.now()+2000;
-    try{localStorage.setItem('_cloudLocalTs',String(_pushTs));}catch(e){}
+    try{localStorage.setItem('_cloudLocalTs',String(_pushTs));localStorage.setItem('_cloudSeenRemote',_stamp);localStorage.setItem('_cloudDirty','0');}catch(e){}
     _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
   }catch(e){ _cloudStatus(es?'⚠️ No se pudo guardar en la nube':'⚠️ Could not save to cloud','#dc2626'); }
 }
@@ -1601,17 +1602,21 @@ async function cloudPull(initial){
     if(!r.ok)throw new Error('HTTP '+r.status);
     const rows=await r.json();
     if(rows&&rows.length&&rows[0].data){
-      const ts=new Date(rows[0].updated_at).getTime()||0;
-      const localTs=parseInt(localStorage.getItem('_cloudLocalTs')||'0')||0;
-      if(ts<=localTs){
-        _cloudApplying=false; _cloudLastRemote=ts;
+      const remoteStamp=String(rows[0].updated_at||'');
+      const seen=localStorage.getItem('_cloudSeenRemote')||'';
+      const dirty=localStorage.getItem('_cloudDirty')==='1';
+      if(remoteStamp===seen){
         _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
-        _cloudBusy=false; if(ts<localTs)cloudSchedulePush(); return;
+        _cloudBusy=false; if(dirty)cloudSchedulePush(); return;
+      }
+      if(dirty){
+        _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
+        _cloudBusy=false; cloudSchedulePush(); return;
       }
       _cloudApplying=true; let changed=false;
       CLOUD_KEYS.forEach(k=>{ const nv=rows[0].data[k]; const cur=localStorage.getItem(k); if(nv!=null&&nv!==cur){ localStorage.setItem(k,nv); changed=true; } });
-      _cloudApplying=false; _cloudLastRemote=ts;
-      if(changed){ try{localStorage.setItem('_cloudLocalTs',String(ts));}catch(e){} }
+      _cloudApplying=false;
+      try{localStorage.setItem('_cloudSeenRemote',remoteStamp);}catch(e){}
       _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
       if(changed){ if(initial){ location.reload(); } else { _cloudShowUpdateBanner(); } }
     } else {
@@ -1621,6 +1626,7 @@ async function cloudPull(initial){
   }catch(e){ _cloudStatus(es?'⚠️ Error de conexión':'⚠️ Connection error','#dc2626'); }
   _cloudBusy=false;
 }
+async function cloudSyncNow(){ if(!cloudOn())return; await cloudPush(true); await cloudPull(true); }
 function _cloudShowUpdateBanner(){
   if(document.getElementById('_cloudBanner'))return;
   const es=currentLang!=='en';
@@ -1630,7 +1636,7 @@ function _cloudShowUpdateBanner(){
   document.body.appendChild(b);
 }
 function _cloudStartPolling(){ if(_cloudPollStarted)return; _cloudPollStarted=true; setInterval(function(){ if(cloudOn()&&!document.getElementById('_cloudBanner'))cloudPull(false); },8000); }
-(function(){ try{ const _set=localStorage.setItem.bind(localStorage); localStorage.setItem=function(k,v){ _set(k,v); try{ if(!_cloudApplying && CLOUD_KEYS.indexOf(k)>=0){ _set('_cloudLocalTs',String(Date.now())); cloudSchedulePush(); } }catch(e){} }; }catch(e){} })();
+(function(){ try{ const _set=localStorage.setItem.bind(localStorage); localStorage.setItem=function(k,v){ _set(k,v); try{ if(!_cloudApplying && CLOUD_KEYS.indexOf(k)>=0){ _set('_cloudLocalTs',String(Date.now())); _set('_cloudDirty','1'); cloudSchedulePush(); } }catch(e){} }; }catch(e){} })();
 
 function renumberData(){
   let i=0;
