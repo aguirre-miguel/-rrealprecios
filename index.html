@@ -2254,6 +2254,7 @@ function transferGuide(){
 }
 
 
+// SAFE-SYNC:BEGIN (bloque usado por test/safe_sync_test.js)
 // ===== SINCRONIZACIÓN EN LA NUBE (Supabase) =====
 const CLOUD_KEYS=['precios_edits_v1','precios_custom_v1','precios_companies_v1','precios_stores_v1','precios_deliverydays_v1','precios_bitacora_v1','precios_transfers_v1','precios_favorites_v1','precios_freq_v1','precios_price_history_v1','precios_par_v1','precios_parbudget_v1','precios_budgetlog_v1','precios_waste_v1','precios_recetas_v1','precios_recetas_seed_ver','precios_recetas_map_v1','precios_recetas_map_ver','precios_pack_v1','precios_pack_ver','monthly_budget','priceAlertThreshold','_dupIgnore','precios_blocked_cos','precios_pdf_cos','precios_co_contacts','precios_devices_v1','precios_chef_contacts','precios_alias_v1','precios_sendlog_v1','precios_az','precios_sender_v1','precios_deleted_v1'];
 const CLOUD_CFG_KEY='preciospro_cloud_cfg';
@@ -2286,57 +2287,211 @@ function cloudDisconnect(){
   showToast(es?'Nube desconectada (los datos quedan en este dispositivo)':'Cloud disconnected (data stays on this device)');
   try{renderDevices();}catch(e){} try{renderSyncBadge();}catch(e){}
 }
-async function cloudPush(silent){
-  if(!cloudOn())return;
-  const es=currentLang!=='en';
-  try{
-    if(!silent)_cloudStatus(es?'⏳ Guardando…':'⏳ Saving…','#d97706');
-    const _pushTs=Date.now();
-    const _stamp=new Date(_pushTs).toISOString();
-    const body=[{id:'main',data:cloudCollect(),updated_at:_stamp}];
-    const r=await fetch(_cloudUrl()+'?on_conflict=id',{method:'POST',headers:Object.assign({'Prefer':'resolution=merge-duplicates,return=minimal'},_cloudHeaders()),body:JSON.stringify(body)});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    _cloudLastRemote=Date.now()+2000;
-    try{localStorage.setItem('_cloudLocalTs',String(_pushTs));localStorage.setItem('_cloudSeenRemote',_stamp);localStorage.setItem('_cloudDirty','0');}catch(e){}
-    _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
-    _cloudDbgSet('↑ push HTTP '+r.status); _cloudMarkSynced();
-  }catch(e){ _cloudStatus(es?'⚠️ No se pudo guardar en la nube':'⚠️ Could not save to cloud','#dc2626'); _cloudDbgSet('↑ push ERROR '+((e&&e.message)||e)); }
+/* ---- SAFE-SYNC: antes de guardar se baja la nube y se MEZCLA por producto (no se pisa todo el blob) ---- */
+const _SS_BASE_KEY='_cloudBase_v1', _SS_DEL_KEY='precios_deleted_v1';
+const _SS_MAP_TS={'precios_edits_v1':'updatedAt','precios_custom_v1':'updatedAt','precios_price_history_v1':'','precios_devices_v1':'last'};
+const _SS_INPLACE=['precios_edits_v1','precios_custom_v1','precios_price_history_v1','precios_devices_v1','precios_deleted_v1'];
+let _cloudAgain=false, _ssMemSig=null;
+function _ssStable(v){ if(v===null||typeof v!=='object')return JSON.stringify(v===undefined?null:v); if(Array.isArray(v))return '['+v.map(_ssStable).join(',')+']'; return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+_ssStable(v[k])).join(',')+'}'; }
+function _ssHash(str){ str=String(str); let s=5381; for(let i=0;i<str.length;i++){ s=((s<<5)+s+str.charCodeAt(i))|0; } return String(s); }
+function _ssSig(v){ return _ssHash(_ssStable(v)); }
+function _ssParse(s,def){ if(s==null)return def; try{ const v=JSON.parse(s); return (v==null)?def:v; }catch(e){ return undefined; } }
+function _ssTs(o,f){ const v=(o&&f)?o[f]:null; if(typeof v==='number')return v; const t=v?Date.parse(v):NaN; return isNaN(t)?0:t; }
+function _ssDevId(){ try{ return localStorage.getItem('precios_device_id')||''; }catch(e){ return ''; } }
+function _ssEditSig(e){ const c=Object.assign({},e); delete c.updatedAt; delete c.by; return _ssSig(c); }
+function _ssLoadBase(){ try{ const b=JSON.parse(localStorage.getItem(_SS_BASE_KEY)||'null'); return (b&&typeof b==='object')?b:null; }catch(e){ return null; } }
+function _ssSaveBase(b){ try{ localStorage.setItem(_SS_BASE_KEY,JSON.stringify(b)); }catch(e){} }
+/* mezcla 3 vías por id: L=local, R=nube, B=firmas de la última sincronización. Nunca borra lo que está en la nube. */
+function _ssMergeMap(L,R,B,tsField,onBoth){
+  const out={}; const ids=Object.keys(R); Object.keys(L).forEach(id=>{ if(!(id in R))ids.push(id); });
+  ids.forEach(id=>{
+    const inL=(id in L), inR=(id in R);
+    if(!inL){ out[id]=R[id]; return; }
+    if(!inR){ out[id]=L[id]; return; }
+    const sl=_ssSig(L[id]), sr=_ssSig(R[id]);
+    if(sl===sr){ out[id]=R[id]; return; }
+    const b=B?B[id]:undefined;
+    const lCh=(b===undefined)||sl!==b, rCh=(b===undefined)||sr!==b;
+    if(!lCh){ out[id]=R[id]; return; }   /* solo cambió en la nube */
+    if(!rCh){ out[id]=L[id]; return; }   /* solo cambió aquí */
+    if(onBoth){ out[id]=onBoth(L[id],R[id]); return; }
+    out[id]=(_ssTs(L[id],tsField)>_ssTs(R[id],tsField))?L[id]:R[id];  /* los dos cambiaron: gana el más nuevo; empate = nube */
+  });
+  return out;
 }
-function cloudSchedulePush(){ if(!cloudOn()||_cloudApplying)return; clearTimeout(_cloudPushT); _cloudPushT=setTimeout(function(){cloudPush();},1200); }
-async function cloudPull(initial){
-  if(!cloudOn()||_cloudBusy)return; _cloudBusy=true;
-  const es=currentLang!=='en';
-  try{
-    _cloudStatus(es?'⏳ Sincronizando…':'⏳ Syncing…','#d97706');
-    const r=await fetch(_cloudUrl()+'?id=eq.main&select=data,updated_at',{headers:_cloudHeaders()});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const rows=await r.json();
-    if(rows&&rows.length&&rows[0].data){
-      const remoteStamp=String(rows[0].updated_at||'');
-      const seen=localStorage.getItem('_cloudSeenRemote')||'';
-      const dirty=(_cloudSigNow()!==_cloudSig);
-      _cloudDbgSet('↓ pull ok remote='+remoteStamp.slice(11,19)+' seen='+seen.slice(11,19)+' dirty='+(dirty?'1':'0'));
-      if(remoteStamp===seen){
-        _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
-        _cloudBusy=false; if(dirty)cloudSchedulePush(); return;
+function _ssUnion(a,b){ const out=b.slice(), seen={}; b.forEach(x=>{seen[_ssStable(x)]=1;}); a.forEach(x=>{ const s=_ssStable(x); if(!seen[s]){seen[s]=1;out.push(x);} }); return out; }
+function cloudMergeData(local,remote,base,dirty){
+  local=local||{}; remote=remote||{};
+  const out={}, nb={};
+  const dl=_ssParse(local[_SS_DEL_KEY],[]), dr=_ssParse(remote[_SS_DEL_KEY],[]);
+  const del=(Array.isArray(dl)&&Array.isArray(dr))?_ssUnion(dl,dr):null;
+  const isDel=id=>!!(del&&del.indexOf(id)>=0);
+  CLOUD_KEYS.forEach(k=>{
+    const lv=local[k], rv=remote[k];
+    let mv, items=null;
+    if(lv==null) mv=rv; else if(rv==null) mv=lv; else if(lv===rv) mv=rv;
+    else if(k===_SS_DEL_KEY&&del){ mv=JSON.stringify(del); }
+    else if(k in _SS_MAP_TS){
+      const isArr=(k==='precios_custom_v1');
+      let L=_ssParse(lv,isArr?[]:{}), R=_ssParse(rv,isArr?[]:{});
+      const ok=isArr?(Array.isArray(L)&&Array.isArray(R)):(L&&R&&typeof L==='object'&&typeof R==='object'&&!Array.isArray(L)&&!Array.isArray(R));
+      if(ok){
+        const toMap=a=>{ const m={}; a.forEach(x=>{ if(x&&x.id)m[x.id]=x; }); return m; };
+        const Lm=isArr?toMap(L):L, Rm=isArr?toMap(R):R;
+        const B=(base&&base[k]&&base[k].items)||null;
+        let onBoth=null;
+        if(k==='precios_price_history_v1') onBoth=(a,b)=>(Array.isArray(a)&&Array.isArray(b))?_ssUnion(a,b).sort((x,y)=>String(x&&x.date).localeCompare(String(y&&y.date))).slice(-24):b;
+        if(k==='precios_devices_v1') onBoth=(a,b)=>(Array.isArray(a)&&Array.isArray(b))?_ssUnion(a,b):((_ssTs(a,'last')>_ssTs(b,'last'))?a:b);
+        let m=_ssMergeMap(Lm,Rm,B,_SS_MAP_TS[k],onBoth);
+        if(k==='precios_devices_v1'&&Array.isArray(m.__revoked)) m.__revoked.forEach(id=>{ delete m[id]; });
+        else if(k!=='precios_devices_v1'&&del) Object.keys(m).forEach(id=>{ if(isDel(id))delete m[id]; });
+        let mo=m;
+        if(isArr){ mo=[]; R.forEach(x=>{ if(x&&x.id&&m[x.id]){ mo.push(m[x.id]); delete m[x.id]; } }); L.forEach(x=>{ if(x&&x.id&&m[x.id]){ mo.push(m[x.id]); delete m[x.id]; } else if(x&&!x.id) mo.push(x); }); }
+        const sm=_ssSig(mo);
+        mv=(sm===_ssSig(R))?rv:(sm===_ssSig(L)?lv:JSON.stringify(mo));
+      } else {
+        mv=dirty?lv:rv;
       }
-      if(dirty){
-        _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
-        _cloudBusy=false; cloudSchedulePush(); return;
-      }
-      _cloudApplying=true; let changed=false;
-      CLOUD_KEYS.forEach(k=>{ const nv=rows[0].data[k]; const cur=localStorage.getItem(k); if(nv!=null&&nv!==cur){ localStorage.setItem(k,nv); changed=true; } });
-      _cloudApplying=false;
-      try{localStorage.setItem('_cloudSeenRemote',remoteStamp);}catch(e){} _cloudMarkSynced();
-      _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
-      if(changed){ if(initial||_cloudSafeToReload()){ location.reload(); } else { _cloudShowUpdateBanner(); } }
     } else {
-      await cloudPush(true);
-      _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
+      /* otras llaves: se respeta el comportamiento anterior, pero solo gana lo local si cambió aquí desde la última sincronización */
+      const b=(base&&base[k])?base[k].sig:undefined;
+      const lCh=(b===undefined)?!!dirty:(_ssHash(lv)!==b);
+      mv=lCh?lv:rv;
     }
-  }catch(e){ _cloudStatus(es?'⚠️ Error de conexión':'⚠️ Connection error','#dc2626'); _cloudDbgSet('↓ pull ERROR '+((e&&e.message)||e)); }
-  _cloudBusy=false;
+    if(mv==null)return;
+    out[k]=mv;
+    nb[k]={sig:_ssHash(mv)};
+    if(k in _SS_MAP_TS){
+      const p=_ssParse(mv,null);
+      if(p&&typeof p==='object'){ items={}; if(Array.isArray(p)) p.forEach(x=>{ if(x&&x.id)items[x.id]=_ssSig(x); }); else Object.keys(p).forEach(id=>{ items[id]=_ssSig(p[id]); }); nb[k].items=items; }
+    }
+  });
+  return {data:out, base:nb};
 }
+/* guardado: marca updatedAt + dispositivo SOLO en los productos que cambiaron en esta pestaña */
+function _ssSnapshotMem(){ _ssMemSig={}; try{ data.forEach(r=>{ if(r.id)_ssMemSig[r.id]=_ssEditSig(_editEntry(r)); }); }catch(e){} }
+function _ssApplyEntry(r,e){
+  if(!r||!e)return;
+  if(e.d!==undefined&&e.d!==null&&e.d!=='')r.d=e.d;
+  coKeys().forEach(k=>{ if(e[k]!==undefined)r[k]=e[k]; });
+  if(e.unit!==undefined)r.unit=e.unit;
+  if(e.notes!==undefined)r.notes=e.notes;
+  if(e.inactive===true||e.inactive===false)r.inactive=e.inactive;
+  r.locks=e.locks||(e.locked?{lc:true,aa:true,lm:true,bm:true}:null);
+  if(e.updatedAt!==undefined)r.updatedAt=e.updatedAt;
+  if(e.by!==undefined)r.by=e.by;
+  if(e.f)r.f=e.f;
+}
+function _ssStampEdits(edits){
+  let prev={}; try{ prev=JSON.parse(localStorage.getItem(EDITS_KEY)||'{}')||{}; }catch(e){}
+  if(!_ssMemSig){ _ssMemSig={}; Object.keys(prev).forEach(id=>{ _ssMemSig[id]=_ssEditSig(prev[id]); }); }
+  const now=new Date().toISOString(), dev=_ssDevId(), byId={};
+  data.forEach(r=>{ if(r.id)byId[r.id]=r; });
+  Object.keys(edits).forEach(id=>{
+    const e=edits[id], s=_ssEditSig(e), was=_ssMemSig[id];
+    if(was!==undefined&&s===was){
+      /* no se tocó aquí: si otra pestaña/sincronización guardó una versión más nueva, se conserva esa */
+      const p=prev[id];
+      if(p&&p.updatedAt&&p.updatedAt!==e.updatedAt&&_ssEditSig(p)!==s){ edits[id]=p; _ssApplyEntry(byId[id],p); }
+      return;
+    }
+    e.updatedAt=now; e.by=dev;
+    if(byId[id]){ byId[id].updatedAt=now; byId[id].by=dev; }
+  });
+  _ssMemSig={}; Object.keys(edits).forEach(id=>{ _ssMemSig[id]=_ssEditSig(edits[id]); });
+}
+/* aplica lo mezclado a la pantalla SIN recargar (así no se pierde el desbloqueo de 15 min) */
+function _ssApplyToMemory(){
+  const edits=_ssParse(localStorage.getItem(EDITS_KEY),{})||{}, custom=_ssParse(localStorage.getItem(CUSTOM_KEY),[])||[], del=_ssParse(localStorage.getItem(_SS_DEL_KEY),[])||[];
+  const byId={}; data.forEach(r=>{ if(r.id)byId[r.id]=r; });
+  if(Array.isArray(custom)) custom.forEach(it=>{ if(it&&it.id&&byId[it.id]) Object.assign(byId[it.id],it); });
+  try{ loadCustomProducts(); }catch(e){}
+  try{ normalizeCompanies(); }catch(e){}
+  data.forEach(r=>{ if(r.id&&edits[r.id])_ssApplyEntry(r,edits[r.id]); });
+  if(Array.isArray(del)&&del.length){ for(let i=data.length-1;i>=0;i--){ if(data[i].id&&del.indexOf(data[i].id)>=0)data.splice(i,1); } }
+  try{ rebuildIndexes(); }catch(e){}
+  _ssSnapshotMem();
+  _ssRender();
+}
+function _ssRender(){
+  if(!_cloudSafeToReload()){ setTimeout(_ssRender,3000); return; }
+  try{ buildTable(); }catch(e){}
+  try{ const p=document.getElementById('panel-recipes'); if(p&&p.classList.contains('active'))renderRecipes(); }catch(e){}
+}
+function _cloudApplyLocal(keys,initial){
+  if(!keys.length)return;
+  if(keys.some(k=>k===EDITS_KEY||k===CUSTOM_KEY||k===_SS_DEL_KEY)) _ssApplyToMemory();
+  if(keys.indexOf('precios_devices_v1')>=0){ try{ renderDevices(); }catch(e){} }
+  const other=keys.filter(k=>_SS_INPLACE.indexOf(k)<0);
+  if(other.length){ _cloudDbgSet('↓ otras llaves: '+other.join(',')); if(initial||_cloudSafeToReload()){ location.reload(); } else { _cloudShowUpdateBanner(); } }
+}
+/* escribe en la nube solo si nadie guardó desde que la leímos (updated_at igual); si no, se vuelve a mezclar */
+async function _cloudWrite(obj,prevStamp,upsert){
+  const stamp=new Date().toISOString();
+  if(!upsert){
+    try{
+      const q='?id=eq.main&updated_at='+(prevStamp?('eq.'+encodeURIComponent(prevStamp)):'is.null')+'&select=id';
+      const r=await fetch(_cloudUrl()+q,{method:'PATCH',headers:Object.assign({'Prefer':'return=representation'},_cloudHeaders()),body:JSON.stringify({data:obj,updated_at:stamp})});
+      if(r.ok){ const rows=await r.json(); return (rows&&rows.length)?stamp:null; }
+      _cloudDbgSet('↑ patch HTTP '+r.status+' → upsert');
+    }catch(e){ _cloudDbgSet('↑ patch ERROR → upsert'); }
+  }
+  const r=await fetch(_cloudUrl()+'?on_conflict=id',{method:'POST',headers:Object.assign({'Prefer':'resolution=merge-duplicates,return=minimal'},_cloudHeaders()),body:JSON.stringify([{id:'main',data:obj,updated_at:stamp}])});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  return stamp;
+}
+async function _cloudSync(o){
+  o=o||{};
+  if(!cloudOn())return;
+  if(_cloudBusy){ _cloudAgain=true; return; }
+  _cloudBusy=true; clearTimeout(_cloudPushT);
+  const es=currentLang!=='en';
+  try{
+    if(!o.silent)_cloudStatus(es?'⏳ Sincronizando…':'⏳ Syncing…','#d97706');
+    let res=null;
+    for(let attempt=0;attempt<4&&!res;attempt++){
+      const r=await fetch(_cloudUrl()+'?id=eq.main&select=data,updated_at',{headers:_cloudHeaders()});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      const rows=await r.json();
+      const hasRow=!!(rows&&rows.length&&rows[0].data);
+      const remote=hasRow?rows[0].data:{}, remoteStamp=hasRow?String(rows[0].updated_at||''):'';
+      const local=cloudCollect(), dirty=(_cloudSigNow()!==_cloudSig), seen=localStorage.getItem('_cloudSeenRemote')||'';
+      _cloudDbgSet('↓ pull ok remote='+remoteStamp.slice(11,19)+' seen='+seen.slice(11,19)+' dirty='+(dirty?'1':'0'));
+      if(hasRow&&remoteStamp===seen&&!dirty){ res={stamp:remoteStamp}; break; }
+      const m=cloudMergeData(local,remote,_ssLoadBase(),dirty);
+      const needPush=!hasRow||CLOUD_KEYS.some(k=>m.data[k]!=null&&m.data[k]!==remote[k]);
+      let stamp=remoteStamp;
+      if(needPush){
+        stamp=await _cloudWrite(m.data,remoteStamp,!hasRow||attempt===3);
+        if(!stamp){ _cloudDbgSet('↑ otro dispositivo guardó en medio, reintento '+(attempt+1)); continue; }
+        _cloudDbgSet('↑ push ok (mezclado)');
+        try{ localStorage.setItem('_cloudLocalTs',String(Date.now())); }catch(e){}
+        _cloudLastRemote=Date.now()+2000;
+      }
+      res={stamp:stamp,merged:m,local:local};
+    }
+    if(!res)throw new Error('conflict');
+    let skipped=false; const changed=[];
+    if(res.merged){
+      _cloudApplying=true;
+      try{
+        CLOUD_KEYS.forEach(k=>{ const nv=res.merged.data[k]; if(nv==null)return; const cur=localStorage.getItem(k); if(cur===nv)return;
+          if(cur!==(res.local[k]==null?null:res.local[k])){ skipped=true; return; }  /* se editó mientras sincronizábamos: va en la próxima vuelta */
+          localStorage.setItem(k,nv); changed.push(k); });
+      }finally{ _cloudApplying=false; }
+      _ssSaveBase(res.merged.base);
+    }
+    try{ localStorage.setItem('_cloudSeenRemote',res.stamp); }catch(e){}
+    if(!skipped){ _cloudMarkSynced(); try{ localStorage.setItem('_cloudDirty','0'); }catch(e){} } else { _cloudAgain=true; }
+    _cloudStatus(es?'✓ Sincronizado':'✓ Synced','#16a085');
+    _cloudApplyLocal(changed,!!o.initial);
+  }catch(e){ _cloudStatus(es?'⚠️ No se pudo sincronizar con la nube':'⚠️ Could not sync with cloud','#dc2626'); _cloudDbgSet('⇅ sync ERROR '+((e&&e.message)||e)); }
+  _cloudBusy=false;
+  if(_cloudAgain){ _cloudAgain=false; setTimeout(function(){ _cloudSync({silent:true}); },300); }
+}
+async function cloudPush(silent){ return _cloudSync({silent:!!silent}); }
+function cloudSchedulePush(){ if(!cloudOn()||_cloudApplying)return; clearTimeout(_cloudPushT); _cloudPushT=setTimeout(function(){cloudPush();},1200); }
+async function cloudPull(initial){ return _cloudSync({silent:false,initial:!!initial}); }
 async function cloudSyncNow(){ if(!cloudOn())return; await cloudPush(true); await cloudPull(true); }
 function _cloudSafeToReload(){ try{ const ae=document.activeElement; if(ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'||ae.isContentEditable))return false; if(document.querySelector('.overlay.show,.modal.show,[id$="Overlay"].show'))return false; return true; }catch(e){ return true; } }
 function _cloudShowUpdateBanner(){
@@ -2359,6 +2514,7 @@ async function _cloudRemoteChanged(){
 }
 function _cloudStartPolling(){ if(_cloudPollStarted)return; _cloudPollStarted=true; setInterval(async function(){ try{ if(!cloudOn()||_cloudApplying)return; if(_cloudSigNow()!==_cloudSig){ cloudPush(true); } else if(!document.getElementById('_cloudBanner')){ if(await _cloudRemoteChanged()) cloudPull(false); } }catch(e){} },30000); }
 (function(){ try{ const _set=localStorage.setItem.bind(localStorage); localStorage.setItem=function(k,v){ _set(k,v); try{ if(!_cloudApplying && CLOUD_KEYS.indexOf(k)>=0){ _set('_cloudLocalTs',String(Date.now())); _set('_cloudDirty','1'); cloudSchedulePush(); } }catch(e){} }; }catch(e){} })();
+// SAFE-SYNC:END
 
 function renumberData(){
   let i=0;
@@ -2491,7 +2647,7 @@ function normalizeProteinUnits(){
   let inProtein=false;
   for(const r of data){
     if(r.cat){inProtein=(r.cat==='PROTEIN');continue;}
-    if(inProtein && r.d && r.d.toUpperCase().indexOf('CHORIZO')<0){ r.unit='lb'; }
+    if(inProtein && !r.unit && r.d && r.d.toUpperCase().indexOf('CHORIZO')<0){ r.unit='lb'; } /* no pisar una unidad ya guardada (ej. ITM012 caja) */
   }
 }
 function _lightCo(hex){try{hex=(hex||'#888888').replace('#','');if(hex.length===3)hex=hex.split('').map(function(c){return c+c;}).join('');var r=parseInt(hex.slice(0,2),16),g=parseInt(hex.slice(2,4),16),b=parseInt(hex.slice(4,6),16);function m(x){return Math.round(x+(255-x)*0.5);}return 'rgb('+m(r)+','+m(g)+','+m(b)+')';}catch(e){return '#cccccc';}}
@@ -5438,11 +5594,13 @@ let historyDateStart='';
 let historyDateEnd='';
 let _photoAbort=false;
 
+function _editEntry(r){return Object.assign({d:r.d,unit:r.unit||'',notes:r.notes||'',inactive:!!r.inactive,locks:r.locks||null,updatedAt:r.updatedAt||'',by:r.by||'',f:r.f||''},coPick(r));}
 function saveCustomProducts(){
+  const edits={};
+  data.forEach(r=>{if(!r.id)return;edits[r.id]=_editEntry(r);});
+  try{_ssStampEdits(edits);}catch(e){}
   const custom=data.filter(r=>r.id&&r.id.startsWith('CUSTOM_'));
   try{localStorage.setItem(CUSTOM_KEY,JSON.stringify(custom));}catch(e){}
-  const edits={};
-  data.forEach(r=>{if(!r.id)return;const e=Object.assign({d:r.d,unit:r.unit||'',notes:r.notes||'',inactive:!!r.inactive,locks:r.locks||null,updatedAt:r.updatedAt||'',f:r.f||''},coPick(r));edits[r.id]=e;});
   try{localStorage.setItem(EDITS_KEY,JSON.stringify(edits));}catch(e){}
 
   _markPendingChanges();
@@ -5464,7 +5622,7 @@ function _markPendingChanges(){
   }catch(e){}
 }
 function loadCustomProducts(){
-  try{const edits=JSON.parse(localStorage.getItem(EDITS_KEY)||'{}');data.forEach(r=>{if(!r.id||!edits[r.id])return;const e=edits[r.id];if(e.d!==undefined&&e.d!==null&&e.d!=='')r.d=e.d;coKeys().forEach(k=>{if(e[k]!==undefined)r[k]=e[k];});if(e.unit!==undefined)r.unit=e.unit;if(e.notes!==undefined)r.notes=e.notes;if(e.inactive===true)r.inactive=true;else if(e.inactive===false)r.inactive=false;if(e.locks)r.locks=e.locks;else if(e.locked)r.locks={lc:true,aa:true,lm:true,bm:true};if(e.updatedAt)r.updatedAt=e.updatedAt;if(e.f)r.f=e.f;});}catch(e){}
+  try{const edits=JSON.parse(localStorage.getItem(EDITS_KEY)||'{}');data.forEach(r=>{if(!r.id||!edits[r.id])return;const e=edits[r.id];if(e.d!==undefined&&e.d!==null&&e.d!=='')r.d=e.d;coKeys().forEach(k=>{if(e[k]!==undefined)r[k]=e[k];});if(e.unit!==undefined)r.unit=e.unit;if(e.notes!==undefined)r.notes=e.notes;if(e.inactive===true)r.inactive=true;else if(e.inactive===false)r.inactive=false;if(e.locks)r.locks=e.locks;else if(e.locked)r.locks={lc:true,aa:true,lm:true,bm:true};if(e.updatedAt)r.updatedAt=e.updatedAt;if(e.by)r.by=e.by;if(e.f)r.f=e.f;});}catch(e){}
   try{const custom=JSON.parse(localStorage.getItem(CUSTOM_KEY)||'[]');custom.forEach(item=>{if(!item.id||data.find(r=>r.id===item.id))return;const _ic=item.scat||item.cat; let insertIdx=data.findIndex(r=>r.cat&&_ic&&r.cat===_ic);if(insertIdx<0){data.push(item);}else{let i=insertIdx+1;while(i<data.length&&!data[i].cat)i++;data.splice(i,0,item);}itemIndex[item.id.toLowerCase()]=item;});}catch(e){}
 }
 function startPriceEditById(id){
@@ -7315,6 +7473,7 @@ document.addEventListener('DOMContentLoaded', function(){
   normalizeCompanies();
   normalizeProteinUnits();
   renumberData();
+  try{_ssSnapshotMem();}catch(e){}
   try{if(cloudOn()){_cloudStartPolling();setTimeout(function(){cloudPull(true);},400);}}catch(e){}
 
   const savedLang = localStorage.getItem('lang');
@@ -8088,10 +8247,10 @@ document.addEventListener('DOMContentLoaded', function(){
        setTimeout(function(){try{renderPriceLockBadge();}catch(e){}},700); }catch(e){}
 
   /* ---- candado de edición de precios ---- */
-  window._priceUnlockedUntil = 0;
+  window._priceUnlockedUntil = (function(){ try{ var u=parseInt(sessionStorage.getItem('_priceUnlockedUntil')||'0',10); return u>Date.now()?u:0; }catch(e){ return 0; } })();
   function priceUnlocked(){ return Date.now() < (window._priceUnlockedUntil||0); }
   window.priceLockNow=function(){
-    var es=esN(); window._priceUnlockedUntil=0;
+    var es=esN(); window._priceUnlockedUntil=0; try{ sessionStorage.removeItem("_priceUnlockedUntil"); }catch(e){}
     try{ showToast(es?'🔒 Precios bloqueados':'🔒 Prices locked'); }catch(e){}
     renderPriceLockBadge();
   };
@@ -8136,7 +8295,7 @@ document.addEventListener('DOMContentLoaded', function(){
     try{ if(typeof getStoredPw==='function') real=getStoredPw(); }catch(e){}
     if(v!==real){ document.getElementById('pwErr').textContent=es?'Contraseña incorrecta.':'Wrong password.'; return; }
     var generic=!!window._pwMode;
-    if(!generic){ window._priceUnlockedUntil=Date.now()+15*60*1000; }
+    if(!generic){ window._priceUnlockedUntil=Date.now()+15*60*1000; try{ sessionStorage.setItem('_priceUnlockedUntil',String(window._priceUnlockedUntil)); }catch(e){} }
     var cb=window._pwOnOk; pwLockClose(); window._pwMode=null;
     if(!generic){ try{ showToast(es?'🔓 Precios desbloqueados (15 min)':'🔓 Prices unlocked (15 min)'); }catch(e){} }
     renderPriceLockBadge();
