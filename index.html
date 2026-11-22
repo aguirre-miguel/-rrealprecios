@@ -3661,10 +3661,11 @@ data.forEach(r=>{if(r.id&&!r.inactive)nameIndex[normStr(r.d)]=r;});
 function rebuildIndexes(){try{Object.keys(nameIndex).forEach(k=>delete nameIndex[k]);data.forEach(r=>{if(r.id&&!r.inactive)nameIndex[normStr(r.d)]=r;});}catch(e){}
  try{Object.keys(itemIndex).forEach(k=>delete itemIndex[k]);data.forEach(r=>{if(r.id){itemIndex[String(r.id).toLowerCase()]=r;itemIndex[normStr(r.d)]=r;}});}catch(e){}}
 
+function _ppActiveExact(r){ if(!r||!r.inactive) return r; try{ var mm=window._ppMergeMaps?window._ppMergeMaps():{}; var t=mm[r.id]; if(t){ var tr=data.find(function(x){return x.id===t&&!x.inactive;}); if(tr) return tr; } }catch(e){} return null; }
 function findByName(query){
   const qn=normStr(query);
 
-  const exact=nameIndex[qn]||itemIndex[qn]||itemIndex[query.toLowerCase().trim()];
+  const exact=_ppActiveExact(nameIndex[qn]||itemIndex[qn]||itemIndex[query.toLowerCase().trim()]);
   if(exact)return exact;
   const qAliased=applyAliases(qn);
   let best=null,bestScore=0;
@@ -3678,7 +3679,7 @@ function findByName(query){
 }
 function _pasteMatch(query){
   const qn=normStr(query);
-  const exact=nameIndex[qn]||itemIndex[qn]||itemIndex[query.toLowerCase().trim()];
+  const exact=_ppActiveExact(nameIndex[qn]||itemIndex[qn]||itemIndex[query.toLowerCase().trim()]);
   if(exact) return {r:exact,exact:true,score:100};
   const qAliased=applyAliases(qn);
   let best=null,bestScore=0;
