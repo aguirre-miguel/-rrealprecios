@@ -3400,7 +3400,7 @@ function processNextPending(){
 
     const qn=normStr(p.nameQuery);
 
-    if(nameIndex[qn]){p.resolved=nameIndex[qn];pendingIndex++;continue;}
+    {const _ex=_ppActiveExact(nameIndex[qn]); if(_ex){p.resolved=_ex;pendingIndex++;continue;}}
     let qAliased=qn;
     for(const [k,v] of Object.entries(ALIASES)){
       if(qn.includes(normStr(k))){qAliased=qn.replace(normStr(k),normStr(v));break;}
@@ -6642,7 +6642,7 @@ function _parBulkProcess(){
     const it=_parBulkQueue[_parBulkIdx];
     if(it.resolved!==null){_parBulkIdx++;continue;}
     const qn=normStr(it.name);
-    if(nameIndex[qn]){ _parAssignPar(nameIndex[qn].id,it.par); _parBulkOk++; it.resolved=true; _parBulkIdx++; continue; }
+    {const _ex=_ppActiveExact(nameIndex[qn]); if(_ex){ _parAssignPar(_ex.id,it.par); _parBulkOk++; it.resolved=true; _parBulkIdx++; continue; }}
     const qAliased=applyAliases(qn);
     let best=null,bestScore=0,secondScore=0;
     for(const r of data){
